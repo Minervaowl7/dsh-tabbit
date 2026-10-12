@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0
+
+- The `@` menu gains a dedicated "标签组" (tab groups) section: groups are
+  first-class candidates, aggregated live from the browser's tab inventory,
+  and can also be found by their member pages' titles/URLs. A group mention
+  is a lightweight reference, not a send-time extraction — the chip carries
+  the group's member list and sending stays instant; the injected
+  `<browser-tab-group>` context guides the model to pull the pages it needs
+  with `tabbit_browser`/`web_fetch` (visible, permission-gated) instead of
+  blocking the send on a multi-page re-fetch. Single-page mentions keep
+  their send-time extraction unchanged.
+- Tab-group home pages (`web.tabbit.ai/group-home/...`) no longer appear in
+  the "网页标签" (web tabs) candidates — they are empty shells with no
+  extractable content.
+- Adapted the injected context message to DSH 0.2's message-source contract:
+  the shared catch-all `plugin` source kind was removed, so the injected
+  message now carries the plugin's own `dsh-tabbit` kind, registered through
+  module augmentation. Both host generations render unknown kinds as the
+  same collapsed injection row.
+
 ## 0.3.5
 
 - Restored `dsh-tabbit` on DSH 0.2+: settings use the new plugin Config form,

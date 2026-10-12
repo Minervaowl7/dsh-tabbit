@@ -12,7 +12,8 @@ Tabbit Browser 的 DeepSeek Harness（dsh）插件包（bundle）。dsh 可以�
 |---|---|
 | **`tabbit_browser`** | 用户使用真实的 Tabbit 内置的 CLI 模式执行网页读取和网页操作。 |
 | **浏览器代理的 `web_fetch`** | 把 dsh 的 `web_fetch` 改接到 Tabbit 上（dsh 自带的直连抓取器无 JS 渲染、无登录态、不走系统代理——在 fake-ip 代理环境下所有域名都会被它拒绝）。 |
-| **"网页标签"输入框提及 `@`** | 在 dsh Web UI 输入框敲 `@`，会列出本会话浏览器任务中打开的页面**以及用户浏览器里的全部标签页**，可以选中成为上下文。 |
+| **"网页标签"输入框提及 `@`** | 在 dsh Web UI 输入框敲 `@`，会列出本会话浏览器任务中打开的页面**以及用户浏览器里的全部标签页**，可以选中成为上下文（标签组首页这类无内容的空壳页已被屏蔽）。 |
+| **"标签组"输入框提及 `@`** | `@` 菜单里独立成组展示：按组名（或成员页标题/URL）搜出整个标签组。提及是轻量【引用】——chip 携带成员页清单、发送零等待，模型在对话里按需用 `tabbit_browser`/`web_fetch` 自提相关页面（过程可见、走权限审批），而不是发送时整组重取。 |
 | **独立"页面读取"权限** | 完善的权限控制。因为与用户共享 cookie，dsh 访问 Tabbit 网页时会确认权限`pageAccess`（默认每会话询问一次）+ `intranetFetch`（web_fetch 访问内网目标默认逐次审批）。 |
 | **`tabbit_browser_install` 工具** | 环境预检：检测已装稳定版 Tabbit、校验 launcher 与 Runtime Service；缺装/过旧时以 dsh 后台任务下载 Tabbit。 |
 | **`tabbit_plugin_update` 工具** | 插件更新检查：每天最多查一次 npm 上的最新发布，有合适版本会离线静默安装； |

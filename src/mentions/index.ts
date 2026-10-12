@@ -22,14 +22,20 @@
  *      直连端点清单，仅 state=available——busy 的是某个自动化任务已认领的，
  *      与任务页重复；且仅 http/https、非新标签页，见 mentionableUserTabUrl）。
  *      两段各自失败互不拖累。
+ *      响应除 tabs 外还带 groups：按 groupId 聚合的标签组清单（组标题 +
+ *      可提取成员页），给前端独立的"标签组"候选源用。标签组主页
+ *      （web.tabbit.ai/group-home/<id>，无正文的空壳导航页）从网页候选、
+ *      任务页候选、组成员三处一律剔除（isGroupHomeUrl）。
  *  - GET  /tabbit/tabs[?instance=<16位大写hex>]
  *      【全 profile】标签页清单（含用户自己开的页面）——直连 Runtime Service
  *      端点读取（runtime/endpoint.ts，~1ms、零副作用、不拉起浏览器），给本机
  *      程序化消费方用。与 roster 不同，这条路由的失败如实回 4xx/5xx。
  *  - POST /tabbit/mention/extract
- *      提取被提及页面的标题+正文（用户点发送时由 chip 的序列化逻辑调用）。
- *      两种请求体：
+ *      兑现被提及内容（用户点发送时由 chip 的序列化逻辑调用）。三种请求体：
  *        {"task","url","index"} —— 任务页：在所属任务里就地读取（live 状态）；
+ *        {"groupRef":{groupId,title,members}} —— 标签组：【零抓取】，只暂存
+ *      组引用（标题+成员页清单）回 token；正文由模型在对话里按需自行提取
+ *      （设计理由见 handleExtract 注释）；
  *        {"url","userTab":true} —— 用户标签页：在 fetch 任务里【重新
  *      打开该 URL】提取后结束任务（与 web_fetch 同机制，共享登录态）。不直接读
  *      用户标签页本体是刻意的：就地读取必须先 claim——那会把用户的标签页
@@ -56,19 +62,23 @@
  *   2. 把消息里的标记文本替换成干净的 "@标题"（用户看到的气泡不再有标记
  *      痕迹）；
  *   3. 在这条消息后面紧跟着插入一条【独立】的消息，source 标成
- *      {kind:'plugin', plugin:'dsh-tabbit', form:'notice'}——dsh 把这种
- *      source.kind 不是 'user' 的消息渲染成默认折叠的"Context injection"
- *      行，而不是普通聊天气泡，正文（含 <browser-tab> 包装）就放在这条
+ *      {kind:'dsh-tabbit', form:'notice', summary:...}——dsh 把这种
+ *      source.kind 不是 'user' 的消息渲染成默认折叠的注入行（标签取 kind
+ *      文本），而不是普通聊天气泡，正文（含 <browser-tab> 包装）就放在这条
  *      消息里。模型两条都会看到，用户默认只看到一行可展开的提示。
  * 这与 dsh 内置的 @文件/@对话 提及是同一套机制（dsh-session-reference 包
- * 的 ctx.on('agent/pre-step', ...) 就是这么把引用的会话正文接进去的）——
- * MessageSourceMap 的 'plugin' 分支就是官方留给三方插件的扩展点，不需要
- * 改宿主代码。
+ * 的 ctx.on('agent/pre-step', ...) 就是这么把引用的会话正文接进去的）。
+ * kind 的注册走 MessageSourceMap 的【模块声明合并】扩展点（见本文件
+ * buildTabContextMessage 上方的 declare module）：DSH ≤0.1.x 曾有一个共享
+ * 的 'plugin' 兜底 kind，0.2 把它删了、改成"每个生产者注册自己的 kind"——
+ * 新旧宿主的聊天 UI 对未知 kind 一律 fall through 成注入行，所以同一套
+ * 运行时行为在两个宿主世代上都成立。
  *
- * 范围说明：@ 候选列表目前仍只覆盖代理自己任务里开的（或被显式 claim 的）
- * 页面——因为 extract 只能对任务内页面执行；用户标签页要先经 claim 接管才能
- * 提取，@ 提及升级为全量候选是后续工作。枚举本身已不受限：新一代 Runtime
- * Service 的 unbound tabs 清单（/tabbit/tabs 路由）就是为此开的口。
+ * 范围说明：@ 候选分两个独立源——"网页标签"（单页：任务页 + 用户标签页，
+ * 发送时提取正文）与"标签组"（整组引用，正文由模型按需提取）。两类都受
+ * "候选必须能兑现内容"的约束：chrome://、chrome-extension://、file:// 等
+ * 无法重取的页一律不列（本地 PDF 阅读器页因此不进组引用——那类内容走
+ * dsh 自带的文件提及更合适）。
  *
  * 隐私边界：/tabbit/tabs 暴露的是用户整个浏览器的标签页元数据（标题+URL），
  * 敏感度高于 roster——与其它路由同样只接受本机回环访问；它不做逐次审批
@@ -80,9 +90,23 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { Context } from '@deepseek-ai/cordis';
 import { boundContextSummary, createUserMessage, freezeMessage } from '@deepseek-ai/dsh-llm';
-import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm';
+import type { ContentBlock, ContextFormed, UserMessage } from '@deepseek-ai/dsh-llm';
+
+/*
+ * 本插件的消息来源 kind，经【模块声明合并】注册进 dsh-llm 的
+ * MessageSourceMap——这是 DSH 0.2 起官方给生产者的扩展方式（0.1.x 的共享
+ * 'plugin' 兜底 kind 已被删除）。kind 取插件名本身：宿主的聊天 UI 对未知
+ * kind 一律 fall through 成默认折叠的注入行、标签显示 kind 文本（新旧宿主
+ * 都验证过这条兜底分支），所以这一个字符串在两个宿主世代上都渲染正常。
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-tabbit': { kind: 'dsh-tabbit' } & ContextFormed;
+  }
+}
 
 import { FETCH_TASK_NAME } from '../core/index.js';
+import type { TabbitTabDescriptor } from '../runtime/endpoint.js';
 import { TabbitCliError } from '../runtime/errors.js';
 import { listInstances } from '../runtime/instances.js';
 import { instanceIdForPeerPort } from '../runtime/peer.js';
@@ -99,6 +123,14 @@ import type {} from '@deepseek-ai/dsh-host-webserver';
 const EVAL_TIMEOUT_MS = 60_000;
 const INVENTORY_TIMEOUT_MS = 15_000;
 const EXTRACT_MAX_CHARS = 60_000;
+/*
+ * 组引用注入里最多列出的成员页数：整组提及是【引用】而非正文（见
+ * handleExtract 的 groupRef 分支注释），清单只是给模型的"可选菜单"，
+ * 列太长只会徒增上下文。超出的页在末尾注明数量。
+ */
+const GROUP_REF_MAX_LISTED = 30;
+/* 组引用请求体里成员清单的硬上限（防恶意大包；正常组远低于此）。 */
+const GROUP_REF_MAX_MEMBERS = 50;
 
 /*
  * 提取正文的暂存有效期：从 /tabbit/mention/extract 写入到 agent/pre-step
@@ -148,13 +180,23 @@ export function apply(ctx: Context): void {
   });
 }
 
-/* /tabbit/mention/extract 暂存的一条提取结果；createdAt 供 TTL 清扫用。 */
+/*
+ * /tabbit/mention/extract 暂存的一条记录；createdAt 供 TTL 清扫用。
+ * 两种形态：
+ *  - 单页提取结果（url/title/text/truncated，refetched 标记重取副本）；
+ *  - 组引用（groupRef:true + members 清单）——【没有正文】，正文由模型在
+ *    对话里按需自行提取（见 handleExtract 的 groupRef 分支注释）。
+ */
 interface StashedExtraction {
   url: string;
   title: string;
   text: string;
   truncated: boolean;
   refetched?: true;
+  /* 组引用形态：成员页清单（已截到 GROUP_REF_MAX_LISTED）与未列出页数。 */
+  groupRef?: true;
+  members?: { url: string; title: string }[];
+  omittedMembers?: number;
   createdAt: number;
 }
 
@@ -199,8 +241,8 @@ function registerContextInjection(ctx: Context, stash: Map<string, StashedExtrac
  * 展开一条消息里的所有 tabbit-tab 标记：
  *  - 没有标记的消息（包括非用户消息）原样返回，不多分配；
  *  - 有标记：标记替换成干净的 "@标题"（这条消息本身，用户在气泡里看到的
- *    形态，见 chipMention），每个标记额外产出一条 source.kind='plugin' 的
- *    兄弟消息（dsh 渲染成默认折叠的 Context injection 行），紧跟在这条
+ *    形态，见 chipMention），每个标记额外产出一条 source.kind='dsh-tabbit'
+ *    的兄弟消息（dsh 渲染成默认折叠的注入行），紧跟在这条
  *    消息后面——顺序即引用顺序，模型读起来跟用户打字的顺序一致。
  */
 async function expandTabMentions(message: UserMessage, stash: Map<string, StashedExtraction>): Promise<UserMessage[]> {
@@ -248,17 +290,48 @@ function chipMention(rawTitle: string): string {
   return `@"${quoted}"`;
 }
 
-/* 把一条暂存的提取结果包装成独立的上下文消息（<browser-tab> 文本块）。 */
+/* 把一条暂存记录包装成独立的上下文消息。组引用走 <browser-tab-group>（无正文
+ * 的引用块，见 buildGroupReferenceMessage），单页走 <browser-tab>（正文块）。 */
 function buildTabContextMessage(entry: StashedExtraction): UserMessage {
+  if (entry.groupRef === true) return buildGroupReferenceMessage(entry);
   const sourceAttr = entry.refetched === true ? ' source="refetched-copy"' : '';
   const truncatedNote = entry.truncated ? '\n[content truncated]' : '';
   const text = `<browser-tab url="${xmlAttrEscape(entry.url)}" title="${xmlAttrEscape(entry.title)}"${sourceAttr}>\n${entry.text}${truncatedNote}\n</browser-tab>`;
   return createUserMessage({
     source: {
-      kind: 'plugin',
-      plugin: 'dsh-tabbit',
+      kind: 'dsh-tabbit',
       form: 'notice',
       summary: boundContextSummary(`Fetched "${entry.title || entry.url}"`),
+    },
+    content: [{ type: 'text', text }],
+  });
+}
+
+/*
+ * 组引用的上下文消息：只给【成员页清单 + 提取指引】，不给正文。
+ *
+ * 措辞要点（模型行为都靠这段文字引导，改动需谨慎）：
+ *  1. 明确"正文不在本条消息里"——防止模型把标题清单当成已读内容；
+ *  2. 指明提取工具（tabbit_browser / web_fetch，用法见 tabbit skill——该
+ *     skill 随本插件装进会话）——模型按 URL 自取自读，过程在对话里可见、
+ *     走 pageAccess 权限；
+ *  3. 禁止仅凭标题臆测内容——lazy 模式的唯一软肋就是模型不取就答。
+ */
+function buildGroupReferenceMessage(entry: StashedExtraction): UserMessage {
+  const members = entry.members ?? [];
+  const lines = members.map((member) => `<page url="${xmlAttrEscape(member.url)}" title="${xmlAttrEscape(member.title)}"/>`);
+  const omittedNote = (entry.omittedMembers ?? 0) > 0 ? `\n[另有 ${entry.omittedMembers} 个页面未列出]` : '';
+  const text = `<browser-tab-group name="${xmlAttrEscape(entry.title)}" pages="${members.length + (entry.omittedMembers ?? 0)}">
+用户引用了 Tabbit 标签组「${entry.title}」。以下是引用时刻组内可读取的页面清单（正文【尚未】提取）：
+${lines.join('\n')}${omittedNote}
+
+这些页面的正文不在本条消息中。请按需使用 tabbit_browser（用法见 tabbit skill）或 web_fetch 提取相关页面的正文后再作答；不要仅凭标题臆测页面内容。
+</browser-tab-group>`;
+  return createUserMessage({
+    source: {
+      kind: 'dsh-tabbit',
+      form: 'notice',
+      summary: boundContextSummary(`Referenced tab group "${entry.title}" (${members.length} pages)`),
     },
     content: [{ type: 'text', text }],
   });
@@ -346,6 +419,17 @@ interface RosterEntry {
 }
 
 /*
+ * roster 响应里的一个标签组。身份是 groupId（浏览器侧的组 id）；标题只是
+ * 展示文本——可重名、可中途改。members 是"能兑现内容"的成员页（过滤规则
+ * 与 collectGroups 一致），前端组候选用它显示页数、按成员标题/URL 过滤。
+ */
+interface RosterGroup {
+  groupId: string;
+  title: string;
+  members: { url: string; title: string }[];
+}
+
+/*
  * 用户标签页可否作为 @ 候选。两条硬规则：
  *  1. 只收 http/https——提及的兑现方式是"共享 fetch 任务里重取该 URL"，而
  *     chrome:// chrome-extension:// file:// about: 等 Playwright 一律
@@ -363,6 +447,56 @@ function mentionableUserTabUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+/*
+ * 标签组主页（web.tabbit.ai/group-home/<id>）：浏览器给每个标签组开的"门面
+ * 页"，本质是个空壳导航页，没有可提取的正文。三处一律排除：
+ *  1. 网页候选——@ 组有独立的组候选，主页混在网页列表里只会误导；
+ *  2. 组成员——提取它只会白烧一页预算，拿到一个空壳；
+ *  3. 任务页候选同理（代理任务开了组主页也不值得 @）。
+ */
+function isGroupHomeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === 'web.tabbit.ai' && parsed.pathname.startsWith('/group-home/');
+  } catch {
+    return false;
+  }
+}
+
+/*
+ * 从全量清单聚合标签组（roster 的 groups 字段与组提取的成员解析共用）：
+ *  - 以 groupId 为身份聚组；标题取组内第一个非空的（同一组各页携带的标题
+ *    理论上一致，防空页/竞态期出现空串）；
+ *  - 成员只收"能兑现内容"的页：http/https、非新标签页、非组主页，按 URL
+ *    去重（同一 URL 在组里开两次只提取一次）；
+ *  - 【状态不限】available/busy 都收：组提取是按 URL 重取新副本，不触碰
+ *    原标签页，busy（被自动化任务认领）不妨碍内容兑现——这点与平铺网页
+ *    候选（为避免与任务页重复而只收 available）刻意不同；
+ *  - 一个可提取成员都没有的组整个不列（@ 了也只能提取到空气）；
+ *  - 排序按组在标签条上的位置（成员的最小 windowId/index）。
+ */
+function collectGroups(tabs: TabbitTabDescriptor[]): RosterGroup[] {
+  const byId = new Map<string, RosterGroup & { firstWindow: number; firstIndex: number }>();
+  for (const tab of tabs) {
+    if (tab.group === null) continue;
+    if (!mentionableUserTabUrl(tab.url) || isGroupHomeUrl(tab.url)) continue;
+    let group = byId.get(tab.group.groupId);
+    if (group === undefined) {
+      group = { groupId: tab.group.groupId, title: tab.group.title, members: [], firstWindow: tab.windowId, firstIndex: tab.index };
+      byId.set(tab.group.groupId, group);
+    }
+    if (group.title === '' && tab.group.title !== '') group.title = tab.group.title;
+    if (!group.members.some((member) => member.url === tab.url)) {
+      group.members.push({ url: tab.url, title: tab.title });
+    }
+    group.firstWindow = Math.min(group.firstWindow, tab.windowId);
+    group.firstIndex = Math.min(group.firstIndex, tab.index);
+  }
+  return [...byId.values()]
+    .sort((a, b) => a.firstWindow - b.firstWindow || a.firstIndex - b.firstIndex)
+    .map(({ groupId, title, members }) => ({ groupId, title, members }));
 }
 
 /*
@@ -384,6 +518,7 @@ async function handleRoster(ctx: Context, req: IncomingMessage, res: ServerRespo
   const sessionId = new URL(req.url ?? '/', 'http://localhost').searchParams.get('session') ?? '';
   if (sessionId === '') return sendJson(res, 400, { error: 'missing session' });
   const tabs: RosterEntry[] = [];
+  const groups: RosterGroup[] = [];
   const notes: string[] = [];
 
   try {
@@ -411,7 +546,7 @@ return out;`,
       for (const entry of value) {
         if (typeof entry !== 'object' || entry === null) continue;
         const { index, url, title } = entry as { index?: unknown; url?: unknown; title?: unknown };
-        if (typeof url !== 'string' || url === 'about:blank') continue;
+        if (typeof url !== 'string' || url === 'about:blank' || isGroupHomeUrl(url)) continue;
         tabs.push({
           kind: 'task-page',
           task,
@@ -428,7 +563,7 @@ return out;`,
   try {
     const inventory = await ctx.tabbit.listAllTabs({ timeoutMs: INVENTORY_TIMEOUT_MS });
     const userTabs = inventory.tabs
-      .filter((tab) => tab.state === 'available' && mentionableUserTabUrl(tab.url))
+      .filter((tab) => tab.state === 'available' && mentionableUserTabUrl(tab.url) && !isGroupHomeUrl(tab.url))
       .sort((a, b) => Number(b.active) - Number(a.active) || a.windowId - b.windowId || a.index - b.index)
       .map(
         (tab): RosterEntry => ({
@@ -443,12 +578,15 @@ return out;`,
         }),
       );
     tabs.push(...userTabs);
+    // 标签组候选与平铺网页候选同一份清单聚合——组主页、不可兑现页已在
+    // collectGroups 里剔除，不会出现"组被平铺候选隐藏后连组候选也丢了"的情况。
+    groups.push(...collectGroups(inventory.tabs));
   } catch (error) {
     // 典型原因：浏览器离线（直连不拉起）、多实例歧义。@ 菜单退回只有任务页。
     notes.push(`user tabs unavailable: ${String((error as Error)?.message ?? error)}`);
   }
 
-  sendJson(res, 200, { tabs, ...(notes.length > 0 ? { note: notes.join('; ') } : {}) });
+  sendJson(res, 200, { tabs, groups, ...(notes.length > 0 ? { note: notes.join('; ') } : {}) });
 }
 
 /*
@@ -513,11 +651,19 @@ function stashAndRespond(
 }
 
 /*
- * 提取路由：把被提及页面的标题+正文抓出来（chip 序列化时调用）。
+ * 提取路由：兑现被提及内容（chip 序列化时调用）。三种请求体：
+ *  - {"task","url","index"} —— 任务页：就地读取（live 状态）；
+ *  - {"url","userTab":true} —— 用户标签页：共享 fetch 任务里重取该 URL；
+ *  - {"groupRef":{groupId,title,members}} —— 标签组：【零抓取】，只把组
+ *    引用（标题+成员页清单）暂存起来回 token。组提及刻意不做发送时提取：
+ *    整组逐页重取最坏要数分钟，把"点发送"卡成一个长等待是不合格的体验；
+ *    而且整组正文一次性灌进上下文（即便有预算截断）也浪费——用户的问题
+ *    往往只涉及组内个别页面。所以组 chip 只注入引用与指引，正文由模型在
+ *    对话里按需用 tabbit_browser / web_fetch 自行提取（见
+ *    buildGroupReferenceMessage 的措辞）。单页提及保持发送时提取不变：
+ *    一页的开销小，"内容必达"的确定性值得。
  *
- * 流程：校验参数 → 确认任务还活着（404 而不是隐式创建）→ 只读求值提取 →
- * 暂存正文、回一次性 token（见 stashAndRespond）。
- * 提取脚本逻辑（模板字符串内，参数经 JSON.stringify 注入防逃逸）：
+ * 单页提取脚本逻辑（模板字符串内，参数经 JSON.stringify 注入防逃逸）：
  *   先按 URL 精确找页（用户选 chip 后页面可能导航走了，URL 是最强身份）；
  *   找不到再按当时的 index 兜底；都没有就报"页面已关闭"。
  *   正文取 article/main/[role=main] 或 body 的 innerText，60k 字符截断。
@@ -528,7 +674,7 @@ function stashAndRespond(
 async function handleExtract(ctx: Context, stash: Map<string, StashedExtraction>, req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (!hostAllowed(req)) return sendJson(res, 403, { error: 'forbidden' });
   if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST only' });
-  let body: { task?: unknown; url?: unknown; index?: unknown; userTab?: unknown };
+  let body: { task?: unknown; url?: unknown; index?: unknown; userTab?: unknown; groupRef?: unknown };
   try {
     body = (await readJsonBody(req)) as typeof body;
   } catch {
@@ -537,6 +683,10 @@ async function handleExtract(ctx: Context, stash: Map<string, StashedExtraction>
   const task = typeof body.task === 'string' ? body.task : '';
   const url = typeof body.url === 'string' ? body.url : '';
   const index = typeof body.index === 'number' ? body.index : -1;
+  // 标签组分支优先：groupRef 是对象即按组引用处理（零抓取，毫秒级返回）。
+  if (typeof body.groupRef === 'object' && body.groupRef !== null) {
+    return stashGroupReference(stash, body.groupRef as Record<string, unknown>, res);
+  }
   if (body.userTab === true) {
     if (url === '') return sendJson(res, 400, { error: 'url is required' });
     // 重取只对 http/https 可行（roster 已按此过滤；这里防直接调用方）。
@@ -628,4 +778,46 @@ try {
   } catch (error) {
     sendJson(res, 500, { error: String((error as Error)?.message ?? error) });
   }
+}
+
+/*
+ * 标签组引用的暂存：【零抓取】——不碰浏览器、不查清单，毫秒级返回。
+ *
+ * 设计理由（与单页提取刻意不同）：整组逐页重取最坏要数分钟，把"点发送"
+ * 卡成长等待不合格；而且整组正文一次性灌进上下文也浪费——用户的问题
+ * 往往只涉及组内个别页面。所以组 chip 只暂存"引用"（组标题 + 成员页
+ * 清单），pre-step 把它展开成 <browser-tab-group> 引用块（清单 + 提取
+ * 指引，见 buildGroupReferenceMessage），正文由模型在对话里按需用
+ * tabbit_browser / web_fetch 自行提取——提取过程在对话里可见、走
+ * pageAccess 权限，比发送时的一次性静默重取更透明、更省。
+ *
+ * 成员清单来自 chip 携带的 roster 快照（选中时刻的实况，服务端 collectGroups
+ * 已按"能兑现内容"过滤过）。这里仍逐字段校验 + 截断：请求体可以伪造，
+ * 清单最终要进入模型上下文，形状必须可控。校验后一个有效成员都不剩就
+ * 如实回 400——前端拿到错误会阻断发送（与单页提取的语义一致）。
+ */
+function stashGroupReference(stash: Map<string, StashedExtraction>, raw: Record<string, unknown>, res: ServerResponse): void {
+  const title = typeof raw.title === 'string' && raw.title.trim() !== '' ? raw.title.trim().slice(0, 120) : '未命名标签组';
+  const rawMembers = Array.isArray(raw.members) ? raw.members : [];
+  const members: { url: string; title: string }[] = [];
+  for (const entry of rawMembers.slice(0, GROUP_REF_MAX_MEMBERS)) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const { url, title: memberTitle } = entry as { url?: unknown; title?: unknown };
+    if (typeof url !== 'string' || !/^https?:\/\//u.test(url)) continue;
+    members.push({ url: url.slice(0, 500), title: typeof memberTitle === 'string' ? memberTitle.slice(0, 120) : '' });
+  }
+  if (members.length === 0) {
+    return sendJson(res, 400, { error: 'group reference carries no valid member pages' });
+  }
+  const listed = members.slice(0, GROUP_REF_MAX_LISTED);
+  const token = stashExtraction(stash, {
+    url: `https://web.tabbit.ai/group-home/${typeof raw.groupId === 'string' ? raw.groupId : ''}`,
+    title,
+    text: '',
+    truncated: false,
+    groupRef: true,
+    members: listed,
+    omittedMembers: members.length - listed.length,
+  });
+  sendJson(res, 200, { title, pageCount: members.length, token });
 }

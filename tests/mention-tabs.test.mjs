@@ -20,6 +20,16 @@ const INVENTORY = {
     { tabId: 15, windowId: 1, index: 4, title: '', url: 'about:blank', active: false, state: 'available', group: null },
     { tabId: 16, windowId: 1, index: 5, title: '扩展查看器', url: 'chrome-extension://abc/viewer.html', active: false, state: 'available', group: null },
     { tabId: 17, windowId: 1, index: 6, title: 'Extensions', url: 'chrome://extensions/', active: false, state: 'available', group: null },
+    // G1 的组主页：无正文空壳页——不进网页候选，也不算组成员。
+    { tabId: 18, windowId: 1, index: 7, title: 'Tab Group-调研', url: 'https://web.tabbit.ai/group-home/G1', active: false, state: 'available', group: { groupId: 'G1', title: '调研' } },
+    // G1 里与 tabId 11 同 URL 的重复页：组成员按 URL 去重，平铺网页候选保留（平铺不去重）。
+    { tabId: 19, windowId: 1, index: 8, title: '文档副本', url: 'https://docs.example/a', active: false, state: 'available', group: { groupId: 'G1', title: '调研' } },
+    // G1 里的 chrome-extension 页：无法重取兑现，不进组成员。
+    { tabId: 20, windowId: 1, index: 9, title: '本地PDF', url: 'chrome-extension://abc/p.pdf', active: false, state: 'available', group: { groupId: 'G1', title: '调研' } },
+    // G2 唯一成员是 busy 页：组成员【状态不限】（提取按 URL 重取），平铺候选仍滤掉。
+    { tabId: 21, windowId: 1, index: 10, title: '忙组页', url: 'https://busy-group.example/', active: false, state: 'busy', group: { groupId: 'G2', title: '忙组' } },
+    // G3 只有组主页、没有可提取成员：整个组不进 groups。
+    { tabId: 22, windowId: 1, index: 11, title: 'Tab Group-空组', url: 'https://web.tabbit.ai/group-home/G3', active: false, state: 'available', group: { groupId: 'G3', title: '空组' } },
   ],
 }
 
@@ -109,12 +119,14 @@ test('roster merges task pages first, then filtered/sorted user tabs', async () 
   assert.deepEqual(evaluated, ['t1'])
   // 顺序：任务页在前；用户标签页 active 最前，其余按 windowId、index。
   // busy / newtab / about:blank / chrome-extension / chrome 均被滤掉
-  // （非 http(s) 页无法重取，候选必须能兑现内容）。
+  // （非 http(s) 页无法重取，候选必须能兑现内容）；标签组主页（group-home）
+  // 也被滤掉——无正文空壳页，@ 组走独立的组候选。
   assert.deepEqual(
     tabs.map((tab) => [tab.kind, tab.url]),
     [
       ['task-page', 'https://task.example/'],
       ['user-tab', 'https://active.example/'],
+      ['user-tab', 'https://docs.example/a'],
       ['user-tab', 'https://docs.example/a'],
       ['user-tab', 'https://w2.example/'],
     ],
@@ -124,6 +136,13 @@ test('roster merges task pages first, then filtered/sorted user tabs', async () 
   assert.equal(doc.group, '调研')
   assert.equal(tabs[1].active, true)
   assert.equal(res.captured.body.note, undefined)
+
+  // groups：按 groupId 聚合；组主页/重复 URL/非 http(s) 页不计入成员；
+  // busy 成员保留（提取按 URL 重取）；没有可提取成员的 G3 整个不列。
+  assert.deepEqual(res.captured.body.groups, [
+    { groupId: 'G1', title: '调研', members: [{ url: 'https://docs.example/a', title: '文档' }] },
+    { groupId: 'G2', title: '忙组', members: [{ url: 'https://busy-group.example/', title: '忙组页' }] },
+  ])
 })
 
 test('roster degrades to task pages only when the inventory is unavailable', async () => {
@@ -139,7 +158,36 @@ test('roster degrades to task pages only when the inventory is unavailable', asy
   await routes.get('/tabbit/mention/tabs')(fakeReq({ url: '/tabbit/mention/tabs?session=s1' }), res)
   assert.equal(res.captured.status, 200)
   assert.deepEqual(res.captured.body.tabs, [])
+  assert.deepEqual(res.captured.body.groups, [])
   assert.match(res.captured.body.note, /user tabs unavailable/)
+})
+
+test('roster excludes tab-group home pages from task page candidates', async () => {
+  const { routes } = mentionCtx({
+    sessionTasks: () => ['t1'],
+    instances: () => [{ id: 'A'.repeat(16), online: true }],
+    client: () => ({
+      listTasks: async () => [{ taskName: 't1' }],
+      evaluate: async () => ({
+        status: 'succeeded',
+        result: {
+          value: [
+            { index: 0, url: 'https://web.tabbit.ai/group-home/G7', title: 'Tab Group-调研' },
+            { index: 1, url: 'https://task.example/real', title: '真任务页' },
+          ],
+        },
+      }),
+    }),
+    listAllTabs: async () => ({ truncated: false, tabs: [] }),
+  })
+  const res = fakeRes()
+  await routes.get('/tabbit/mention/tabs')(fakeReq({ url: '/tabbit/mention/tabs?session=s1' }), res)
+  assert.equal(res.captured.status, 200)
+  // 组主页就算开在代理任务里也不进候选——它没有任何可提取内容。
+  assert.deepEqual(
+    res.captured.body.tabs.map((tab) => tab.url),
+    ['https://task.example/real'],
+  )
 })
 
 test('extract with userTab stashes the body and closes its fetch task', async () => {
@@ -208,6 +256,110 @@ test('extract without userTab still requires a task', async () => {
   assert.equal(res.captured.status, 400)
 })
 
+/* ── 标签组引用（{"groupRef": {groupId,title,members}}，零抓取）── */
+
+test('extract with groupRef stashes the reference instantly without touching the browser', async () => {
+  // 任何浏览器通路被调用都直接炸——组引用刻意零抓取，这两个假件绝不该被碰到。
+  const { routes, preStep } = mentionCtx({
+    listAllTabs: async () => {
+      throw new Error('must not list tabs')
+    },
+    withFetchTask: async () => {
+      throw new Error('must not open the fetch task')
+    },
+  })
+  const res = fakeRes()
+  await routes.get('/tabbit/mention/extract')(
+    fakeReq({
+      url: '/tabbit/mention/extract',
+      method: 'POST',
+      body: JSON.stringify({
+        groupRef: {
+          groupId: 'G1',
+          title: '调研',
+          members: [
+            { url: 'https://docs.example/a', title: '文档' },
+            { url: 'chrome-extension://abc/p.pdf', title: '坏页' }, // 非 http(s)，校验剔除
+            { url: 'https://notes.example/b', title: '' },
+          ],
+        },
+      }),
+    }),
+    res,
+  )
+
+  assert.equal(res.captured.status, 200)
+  assert.equal(res.captured.body.title, '调研')
+  assert.equal(res.captured.body.pageCount, 2) // 坏页被剔除，不计入
+  assert.equal(res.captured.body.text, undefined) // 引用没有正文，只有 token
+  assert.equal(typeof res.captured.body.token, 'string')
+
+  // pre-step 展开成 <browser-tab-group> 引用块：成员清单 + 提取指引。
+  const sent = userMessage(`总结一下 @[调研](tabbit-tab:${res.captured.body.token})`)
+  const decision = await preStep({}, enterWith([sent]))
+  assert.equal(decision.messages.length, 2)
+  assert.equal(decision.messages[0].content[0].text, '总结一下 @调研')
+  const context = decision.messages[1]
+  assert.equal(context.source.kind, 'dsh-tabbit')
+  const text = context.content[0].text
+  assert.match(text, /<browser-tab-group name="调研" pages="2">/)
+  assert.match(text, /<page url="https:\/\/docs\.example\/a" title="文档"\/>/)
+  assert.match(text, /<page url="https:\/\/notes\.example\/b" title=""\/>/)
+  assert.doesNotMatch(text, /chrome-extension/)
+  // 指引三要素：正文不在消息里、用 tabbit_browser / web_fetch 自提、禁止臆测。
+  assert.match(text, /正文【尚未】提取/)
+  assert.match(text, /tabbit_browser/)
+  assert.match(text, /web_fetch/)
+  assert.match(text, /不要仅凭标题臆测页面内容/)
+})
+
+test('extract with groupRef rejects a reference carrying no valid members', async () => {
+  const { routes } = mentionCtx({})
+  for (const groupRef of [
+    { groupId: 'G1', title: '调研' }, // members 缺失
+    { groupId: 'G1', title: '调研', members: [] }, // 空清单
+    { groupId: 'G1', title: '调研', members: [{ url: 'chrome://extensions/', title: 'x' }] }, // 全无效
+  ]) {
+    const res = fakeRes()
+    await routes.get('/tabbit/mention/extract')(
+      fakeReq({ url: '/tabbit/mention/extract', method: 'POST', body: JSON.stringify({ groupRef }) }),
+      res,
+    )
+    assert.equal(res.captured.status, 400, JSON.stringify(groupRef))
+    assert.match(res.captured.body.error, /no valid member pages/)
+  }
+})
+
+test('extract with groupRef caps the listed members and notes the omitted count', async () => {
+  const { routes, preStep } = mentionCtx({})
+  const members = Array.from({ length: 35 }, (_, i) => ({ url: `https://g.example/${i}`, title: `页${i}` }))
+  const res = fakeRes()
+  await routes.get('/tabbit/mention/extract')(
+    fakeReq({ url: '/tabbit/mention/extract', method: 'POST', body: JSON.stringify({ groupRef: { groupId: 'G9', title: '大组', members } }) }),
+    res,
+  )
+  assert.equal(res.captured.status, 200)
+  assert.equal(res.captured.body.pageCount, 35)
+
+  const sent = userMessage(`@[大组](tabbit-tab:${res.captured.body.token})`)
+  const decision = await preStep({}, enterWith([sent]))
+  const text = decision.messages[1].content[0].text
+  assert.match(text, /<browser-tab-group name="大组" pages="35">/)
+  assert.equal(text.match(/<page url=/gu)?.length, 30) // 只列 30 个
+  assert.match(text, /\[另有 5 个页面未列出\]/)
+})
+
+test('extract with a non-object groupRef falls through to the task/url validation', async () => {
+  const { routes } = mentionCtx({})
+  const res = fakeRes()
+  await routes.get('/tabbit/mention/extract')(
+    fakeReq({ url: '/tabbit/mention/extract', method: 'POST', body: JSON.stringify({ groupRef: 'G1' }) }),
+    res,
+  )
+  assert.equal(res.captured.status, 400)
+  assert.match(res.captured.body.error, /task and url are required/)
+})
+
 /* ── agent/pre-step：token → 折叠上下文消息 ── */
 
 test('pre-step expands a tabbit-tab marker into a clean mention plus a collapsed context message', async () => {
@@ -240,9 +392,10 @@ test('pre-step expands a tabbit-tab marker into a clean mention plus a collapsed
   assert.equal(decision.messages[0].content[0].text, '总结一下 @文档')
   assert.equal(decision.messages[0].source.kind, 'user')
   // 紧跟着的是一条折叠的上下文消息，正文完整、source 不是 'user'。
+  // kind 是本插件经模块声明合并注册进宿主 MessageSourceMap 的自有种类
+  // （DSH 0.2 删除了共享的 'plugin' 兜底 kind，见 src/mentions/index.ts）。
   const context = decision.messages[1]
-  assert.equal(context.source.kind, 'plugin')
-  assert.equal(context.source.plugin, 'dsh-tabbit')
+  assert.equal(context.source.kind, 'dsh-tabbit')
   assert.equal(context.source.form, 'notice')
   assert.match(context.content[0].text, /<browser-tab url="https:\/\/docs\.example\/a" title="文档">/)
   assert.match(context.content[0].text, /完整正文/)

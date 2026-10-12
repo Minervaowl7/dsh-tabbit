@@ -16,7 +16,8 @@ benchmarks.
 |---|---|
 | `tabbit_browser` | Read and operate web pages using Tabbit's real, built-in CLI mode. |
 | Browser-backed `web_fetch` | Re-points dsh's `web_fetch` to Tabbit itself (dsh's built-in direct fetcher has no JS rendering, no login state, and bypasses the system proxy — under a fake-IP proxy setup it refuses every domain). |
-| "Web tabs" `@` mention | Type `@` in the dsh Web UI input box to list pages open in this session's browser tasks **and every tab in the user's browser** — pick one to add as context. |
+| "Web tabs" `@` mention | Type `@` in the dsh Web UI input box to list pages open in this session's browser tasks **and every tab in the user's browser** — pick one to add as context (contentless tab-group home pages are filtered out). |
+| "Tab groups" `@` mention | Shown as its own section in the `@` menu: find a whole tab group by name (or by any member page's title/URL). A group mention is a lightweight *reference* — the chip carries the member list and sending stays instant; the model pulls the pages it needs with `tabbit_browser`/`web_fetch` during the conversation (visible, permission-gated) instead of blocking the send on a full-group re-fetch. |
 | Dedicated "page access" permission | Full permission controls. Because dsh shares the user's cookies when it reaches Tabbit pages, it confirms `pageAccess` (asked once per session by default) and `intranetFetch` (per-request approval when `web_fetch` targets an intranet address). |
 | `tabbit_browser_install` tool | Environment preflight: detects an installed stable Tabbit build and verifies the launcher and Runtime Service; downloads Tabbit as a dsh background job when it's missing or outdated. |
 | `tabbit_plugin_update` tool | Plugin update check: asks npm for the latest release at most once a day, and silently installs a suitable version in the background. |

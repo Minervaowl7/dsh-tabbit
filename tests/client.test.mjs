@@ -45,7 +45,7 @@ function mockServices({ requested, registeredNodes, slotRegistrations, sources, 
   }
 }
 
-test('registers the @tab source and nothing else', () => {
+test('registers the tab and tab-group sources and nothing else', () => {
   const client = loadClient()
   assert.equal(client.name, 'dsh-tabbit-client')
   assert.deepEqual(client.inject, ['inputTriggers'])
@@ -56,13 +56,85 @@ test('registers the @tab source and nothing else', () => {
   const sources = []
   client.apply(mockServices({ requested, registeredNodes, slotRegistrations, sources }))
 
-  assert.equal(sources.length, 1)
-  assert.equal(typeof sources[0].name, 'string')
+  // 两个独立 @ 源："网页标签"（单页）在前，"标签组"（整组）在后——宿主的
+  // @ 菜单按源分节渲染，标签组由此单独成组展示。
+  assert.equal(sources.length, 2)
+  assert.equal(sources[0].name, '网页标签')
+  assert.equal(sources[0].order, 10)
+  assert.equal(sources[1].name, '标签组')
+  assert.equal(sources[1].order, 11)
 
   // issue #22 回归守卫：不注册会话节点、不占聊天插槽，也不去探测那几个服务。
   assert.equal(registeredNodes.length, 0)
   assert.equal(slotRegistrations.length, 0)
   assert.deepEqual(requested, ['inputTriggers'])
+})
+
+test('tab-group source lists roster groups, filters by member titles, shares the roster, and serializes to a group extraction', async () => {
+  const client = loadClient()
+  const sources = []
+  client.apply(mockServices({ requested: [], registeredNodes: [], slotRegistrations: [], sources }))
+  const groupSource = sources.find((s) => s.name === '标签组')
+  const tabSource = sources.find((s) => s.name === '网页标签')
+
+  const roster = {
+    tabs: [{ kind: 'user-tab', url: 'https://docs.example/a', title: '文档', tabId: 11 }],
+    groups: [
+      { groupId: 'G1', title: '调研', members: [{ url: 'https://docs.example/a', title: '文档' }] },
+      {
+        groupId: 'G2',
+        title: '商业化',
+        members: [
+          { url: 'https://a.example/1', title: '定价' },
+          { url: 'https://a.example/2', title: '复盘' },
+        ],
+      },
+    ],
+  }
+  const fetched = []
+  globalThis.fetch = async (url, init) => {
+    fetched.push({ url: String(url), init })
+    if (String(url).startsWith('/tabbit/mention/tabs')) return { ok: true, json: async () => roster }
+    if (String(url) === '/tabbit/mention/extract') return { ok: true, json: async () => ({ token: 'tok-1', title: '调研' }) }
+    throw new Error('unexpected fetch: ' + url)
+  }
+  try {
+    const session = { sessionId: 's1' }
+    // 无过滤词：两组都出；描述带可提取页数；folder 图标。
+    const all = await groupSource.candidates(session, { query: '' })
+    assert.deepEqual(
+      all.map((c) => [c.name, c.description, c.icon, c.hint]),
+      [
+        ['调研', '1 个页面', 'folder', 'Tabbit'],
+        ['商业化', '2 个页面', 'folder', 'Tabbit'],
+      ],
+    )
+    // 成员页标题/URL 也能把组搜出来（想不起组名时按内容找组）。
+    const byMember = await groupSource.candidates(session, { query: '定价' })
+    assert.deepEqual(byMember.map((c) => c.name), ['商业化'])
+
+    // 两个源共用一份 roster：2 秒 TTL 内网页标签源不应再发请求。
+    const rosterCalls = () => fetched.filter((f) => f.url.startsWith('/tabbit/mention/tabs')).length
+    const before = rosterCalls()
+    await tabSource.candidates(session, { query: '' })
+    assert.equal(rosterCalls(), before)
+
+    // onPick → ref 携带组引用（groupId + 成员清单）；serialize → POST
+    // {"groupRef":{...}}（零抓取，毫秒级），产出短标记。
+    const pick = groupSource.onPick({ candidate: all[0] })
+    assert.equal(pick.insert.source, '标签组')
+    const pickRef = JSON.parse(pick.insert.ref)
+    assert.equal(pickRef.groupId, 'G1')
+    assert.deepEqual(pickRef.members, [{ url: 'https://docs.example/a', title: '文档' }])
+    const marker = await groupSource.codec.serialize(pick.insert.ref)
+    assert.equal(marker, '@[调研](tabbit-tab:tok-1)')
+    const extractCall = fetched.find((f) => f.url === '/tabbit/mention/extract')
+    assert.deepEqual(JSON.parse(extractCall.init.body), {
+      groupRef: { groupId: 'G1', title: '调研', members: [{ url: 'https://docs.example/a', title: '文档' }] },
+    })
+  } finally {
+    delete globalThis.fetch
+  }
 })
 
 test('stays silent when the input-trigger service is missing', () => {
