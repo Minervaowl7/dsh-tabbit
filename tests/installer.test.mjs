@@ -154,6 +154,43 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\TabbitDev
   assert.equal(found[0].executable, String.raw`C:\Users\User\AppData\Local\Tabbit\Application\Tabbit.exe`)
 })
 
+test('Windows uninstall parsing falls back to the uninstall key name when DisplayName is localized', () => {
+  // 中文 Windows 上安装器写的是本地化的 DisplayName，子键名仍是英文。
+  // 只认 DisplayName 会让预检在非英文系统上报"未安装"。
+  const output = String.raw`
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\Tabbit
+    DisplayName    REG_SZ    Tabbit浏览器
+    DisplayVersion    REG_SZ    1.9.22.0
+    InstallLocation    REG_SZ    C:\Users\User\AppData\Local\Tabbit
+    DisplayIcon    REG_SZ    "C:\Users\User\AppData\Local\Tabbit\Application\Tabbit.exe",0
+
+HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\Tabbit Browser
+    DisplayName    REG_SZ    Tabbit浏览器
+    DisplayVersion    REG_SZ    1.9.22.0
+    InstallLocation    REG_SZ    C:\Program Files\Tabbit Browser
+`
+  const found = parseWindowsUninstallRegistry(output)
+  assert.equal(found.length, 2)
+  assert.deepEqual(found.map(item => item.edition), ['international', 'domestic'])
+  assert.ok(found.every(item => item.channel === 'stable'))
+  // name 保留安装器写进去的本地化显示名，不拿键名覆盖它。
+  assert.deepEqual(found.map(item => item.name), ['Tabbit浏览器', 'Tabbit浏览器'])
+})
+
+test('Windows uninstall parsing still prefers DisplayName over a generated key name', () => {
+  // 回归保护：递归回退分支会扫到随机生成的键名，那些记录只能靠 DisplayName 认出来，
+  // 键名兜底不该抢在它前面。
+  const output = String.raw`
+HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\{4A1F0C9E-8B7D-4E2A-9C31-5D6E7F8A9B0C}
+    DisplayName    REG_SZ    Tabbit Browser
+    DisplayVersion    REG_SZ    1.9.22.0
+`
+  const found = parseWindowsUninstallRegistry(output)
+  assert.equal(found.length, 1)
+  assert.equal(found[0].edition, 'domestic')
+  assert.equal(found[0].name, 'Tabbit Browser')
+})
+
 test('uses targeted Windows uninstall keys before the recursive fallback', () => {
   const calls = []
   const output = String.raw`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\Tabbit Browser

@@ -239,7 +239,8 @@ export async function detectMacInstallations({
  *       DisplayVersion REG_SZ    1.9.2
  *       ...
  * 状态机式逐行扫：见到 HKEY_ 开头行 = 新记录开始（先提交上一条）；
- * 缩进行按 "键 REG_类型 值" 抽字段。commit 时只认 DisplayName 在白名单里的；
+ * 缩进行按 "键 REG_类型 值" 抽字段。commit 时认 DisplayName 或子键名在白名单里
+ * 的（前者随系统语言本地化、后者固定英文，见 commit 内注释）；
  * DisplayIcon 常带 ",索引" 后缀和包裹引号，清理后当可执行文件路径用。
  * 导出仅为可单测（纯文本进、结构出）。
  */
@@ -249,7 +250,17 @@ export function parseWindowsUninstallRegistry(output: string): DetectedInstallat
 
   const commit = () => {
     if (!record) return;
-    const identity = WINDOWS_DISPLAY_NAMES.get(record.DisplayName ?? '');
+    /*
+     * DisplayName 之外再按【卸载子键名】兜一次。DisplayName 是随系统语言本地化
+     * 的：中文 Windows 上装完写进去的是 "Tabbit浏览器"，只按它查白名单会在
+     * 非英文系统上把已装的浏览器整个漏掉（预检报"未安装"，进而触发多余的下载）。
+     * 子键名则由各自安装器固定写成英文（targetedKeys 探测的就是 'Tabbit' /
+     * 'Tabbit Browser'），与系统语言无关。
+     * 顺序保持 DisplayName 优先：递归回退分支会扫到任意键名（如 {generated}），
+     * 那些记录只能靠 DisplayName 认出来，键名兜底不该抢在它前面。
+     */
+    const identity = WINDOWS_DISPLAY_NAMES.get(record.DisplayName ?? '')
+      ?? WINDOWS_DISPLAY_NAMES.get(record.registryKey?.split('\\').pop() ?? '');
     if (!identity) return;
     const icon = record.DisplayIcon?.replace(/,\s*-?\d+$/, '').replace(/^"(.*)"$/, '$1');
     installations.push({
