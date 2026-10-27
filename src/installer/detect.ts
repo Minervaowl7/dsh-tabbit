@@ -30,6 +30,7 @@ import { constants } from 'node:fs';
 import { access } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { TextDecoder } from 'node:util';
 
 /* 支持的最低稳定版版本。 */
 export const MINIMUM_TABBIT_VERSION = '1.9.0';
@@ -68,10 +69,34 @@ interface RunResult {
 }
 type RunFn = (command: string, args: string[]) => RunResult;
 
-/* 默认实现：spawnSync 同步执行（检测场景低频短命令，同步最简单）。 */
+/*
+ * 把外部命令的原始输出解成文本。
+ * Windows 上的控制台程序（reg.exe）按【控制台代码页】写输出，简中系统是
+ * GBK/cp936；直接按 UTF-8 解码会把用户名等非 ASCII 字符变成 U+FFFD，
+ * 于是 InstallLocation/DisplayIcon 里的真实路径被读成 "C:\\Users\\����\\..."
+ * ——检测本身能过，但拿到的 path/executable 是坏的，后续按它找 exe 会失败。
+ * 判定顺序：先按 UTF-8 解，没有替换字符就用它（macOS 的 plutil、英文
+ * Windows 的 reg.exe 都属于这种）；出现替换字符再按 GBK 重解一次。
+ * Node 的 full-icu 构建支持 'gbk'；small-icu 构建会抛错，此时退回 UTF-8
+ * 结果，行为与修改前一致。
+ */
+export function decodeConsoleOutput(bytes: Uint8Array | undefined): string {
+  const buf = bytes ?? new Uint8Array(0);
+  const utf8 = new TextDecoder('utf-8').decode(buf);
+  if (!utf8.includes('\uFFFD')) return utf8;
+  try {
+    return new TextDecoder('gbk').decode(buf);
+  } catch {
+    return utf8;
+  }
+}
+
+/* 默认实现：spawnSync 同步执行（检测场景低频短命令，同步最简单）。
+ * 输出按原始字节收（encoding: 'buffer'）再交给 decodeConsoleOutput 解码，
+ * 理由见上一个函数的注释。 */
 const defaultRun: RunFn = (command, args) => {
-  const result = spawnSync(command, args, { encoding: 'utf8', windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
-  return { status: result.status, stdout: result.stdout ?? '' };
+  const result = spawnSync(command, args, { encoding: 'buffer', windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
+  return { status: result.status, stdout: decodeConsoleOutput(result.stdout ?? undefined) };
 };
 
 /* 两条发行线的官网源。 */
