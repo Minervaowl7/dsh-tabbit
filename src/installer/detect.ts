@@ -70,25 +70,62 @@ interface RunResult {
 type RunFn = (command: string, args: string[]) => RunResult;
 
 /*
- * 把外部命令的原始输出解成文本。
- * Windows 上的控制台程序（reg.exe）按【控制台代码页】写输出，简中系统是
- * GBK/cp936；直接按 UTF-8 解码会把用户名等非 ASCII 字符变成 U+FFFD，
- * 于是 InstallLocation/DisplayIcon 里的真实路径被读成 "C:\\Users\\����\\..."
- * ——检测本身能过，但拿到的 path/executable 是坏的，后续按它找 exe 会失败。
- * 判定顺序：先按 UTF-8 解，没有替换字符就用它（macOS 的 plutil、英文
- * Windows 的 reg.exe 都属于这种）；出现替换字符再按 GBK 重解一次。
- * Node 的 full-icu 构建支持 'gbk'；small-icu 构建会抛错，此时退回 UTF-8
- * 结果，行为与修改前一致。
+ * 控制台代码页 → TextDecoder 标签。只列 ICU 支持、且这些语言的 Windows 上
+ * 确实会遇到的几个；不在表里的（cp1252/cp1250 等）不做兜底——宁可保留明显的
+ * U+FFFD，也不要按错误的代码页静默解成一串似是而非的错字，那样更难排查。
  */
-export function decodeConsoleOutput(bytes: Uint8Array | undefined): string {
+const OEM_CODEPAGE_LABELS: Record<string, string> = {
+  '936': 'gbk', // 简中
+  '950': 'big5', // 繁中
+  '932': 'shift_jis', // 日文
+  '949': 'euc-kr', // 韩文
+  '1251': 'windows-1251', // 西里尔（俄/乌/保等）
+};
+
+/*
+ * 把外部命令的原始输出解成文本。
+ * Windows 上的控制台程序（reg.exe）按【控制台代码页】写输出（简中 = GBK/cp936），
+ * 直接按 UTF-8 解码会把用户名等非 ASCII 字符变成 U+FFFD，于是
+ * InstallLocation/DisplayIcon 里的真实路径被读成 "C:\\Users\\����\\..."
+ * ——检测本身能过，但拿到的 path/executable 是坏的，后续按它找 exe 会失败。
+ * 判定顺序：先按 UTF-8 解，没有替换字符就用它（macOS 的 plutil、英文 Windows
+ * 的 reg.exe 都属于这种）；出现替换字符时，只有本机 ANSI 代码页在
+ * OEM_CODEPAGE_LABELS 里才重解一次，否则原样返回（与修改前一致）。
+ * fallbackLabel 可注入，便于在 CI（不会为了测试改系统代码页）上覆盖两条分支。
+ */
+export function decodeConsoleOutput(
+  bytes: Uint8Array | undefined,
+  fallbackLabel: string | null = windowsOemFallbackLabel(),
+): string {
   const buf = bytes ?? new Uint8Array(0);
   const utf8 = new TextDecoder('utf-8').decode(buf);
   if (!utf8.includes('\uFFFD')) return utf8;
+  if (!fallbackLabel) return utf8;
   try {
-    return new TextDecoder('gbk').decode(buf);
+    return new TextDecoder(fallbackLabel).decode(buf);
   } catch {
     return utf8;
   }
+}
+
+/*
+ * 本机 ANSI 代码页对应的解码器标签（读 NLS\CodePage 的 ACP）；读不到、
+ * 不在表内、或非 Windows 一律返回 null。结果缓存：检测一次会话最多跑几回，
+ * 不值得每次解码都 spawn 一个 reg.exe。
+ */
+let cachedOemFallbackLabel: string | null | undefined;
+function windowsOemFallbackLabel(): string | null {
+  if (cachedOemFallbackLabel !== undefined) return cachedOemFallbackLabel;
+  cachedOemFallbackLabel = null;
+  if (process.platform === 'win32') {
+    const probe = spawnSync('reg.exe', ['query', 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\NLS\\CodePage', '/v', 'ACP'], {
+      encoding: 'buffer',
+      windowsHide: true,
+    });
+    const acp = /\bACP\s+REG_SZ\s+(\d+)/i.exec(String(probe.stdout ?? ''))?.[1];
+    if (acp && OEM_CODEPAGE_LABELS[acp]) cachedOemFallbackLabel = OEM_CODEPAGE_LABELS[acp];
+  }
+  return cachedOemFallbackLabel;
 }
 
 /* 默认实现：spawnSync 同步执行（检测场景低频短命令，同步最简单）。
